@@ -31,8 +31,8 @@
 
         if (window["WebSocket"]) {
           const searchParams = new URLSearchParams(window.location.search);
-          if (!searchParams.get("from") || !searchParams.get("to")) {
-            window.alert("cannot chat");
+          if (!searchParams.get("chat_id") || !searchParams.get("user_id")) {
+            window.alert("not in chat");
           }
           conn = new WebSocket(
             "ws://" + document.location.host + "/ws" + window.location.search,

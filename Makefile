@@ -1,9 +1,9 @@
 run:
-	open http://localhost:9090?from=alice\&to=bob
+	open http://localhost:9090?chat_id=chat-1\&user_id=alice
 	go run *.go -addr=:9090
 
 run2:
-	open http://localhost:8080?from=bob\&to=alice
+	open http://localhost:8080?chat_id=chat-1\&user_id=bob
 	go run *.go -addr=:8080
 
 

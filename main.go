@@ -24,21 +24,17 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "home.html")
 }
 
-var rdb *redis.Client
-
 func main() {
 	flag.Parse()
 
-	rdb = redis.NewClient(&redis.Options{
+	rdb := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379", // use default address
 		Password: "",               // no password set
 		DB:       0,                // use default DB
 	})
 
 	http.HandleFunc("/", serveHome)
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		serveWs(w, r)
-	})
+	http.Handle("/ws", &wsServer{rdb})
 	slog.Info("listening to server. press ctrl+c to cancel", "port", *addr)
 	err := http.ListenAndServe(*addr, nil)
 	if err != nil {

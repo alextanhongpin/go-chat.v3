@@ -3,15 +3,19 @@ package main
 import (
 	"cmp"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 )
+
+var ErrClosed = errors.New("chat: write closed")
 
 const (
 	// Time allowed to write a message to the peer.
@@ -35,74 +39,140 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 }
 
-func readPump(ctx context.Context, conn *websocket.Conn, userID, friendID string) {
+type wsServer struct {
+	rdb *redis.Client
+}
+
+func (svr *wsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println(err)
+		return
+	}
 	defer func() {
 		_ = conn.Close()
 	}()
-	conn.SetReadLimit(maxMessageSize)
-	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
-	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(pongWait)) })
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+
+	// authorize
+	// validate
+	// create session
+
+	id := r.URL.Query().Get("chat_id")
+	userID := r.URL.Query().Get("user_id")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session := NewChatSession[any](conn, id)
+
+	var wg sync.WaitGroup
+	// Write back to websocket.
+	// Subscribe to redis pubsub.
+	wg.Go(func() {
+		pubsub := svr.rdb.Subscribe(ctx, id)
+		defer func() {
+			_ = pubsub.Close()
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-pubsub.Channel():
+				err = session.Write(ctx, []byte(msg.Payload))
+				if err != nil {
+					return
+				}
 			}
-			break
 		}
+	})
+	// TODO: Add online presence indicator.
+	// wg.Go(func() { stayOnline() })
 
-		err = rdb.Publish(ctx, friendID, message).Err()
-		if err != nil {
-			_ = conn.WriteMessage(websocket.CloseMessage, []byte{})
-			log.Printf("error: %v", err)
-			break
-		}
+	// Read websocket messages. Blocking read.
+	session.Read(func(msg []byte) error {
+		return svr.rdb.Publish(ctx, id, fmt.Appendf(nil, "%s: %s", userID, msg)).Err()
+	})
+	cancel()
+	wg.Wait()
+	log.Println("disconnected from", id)
+}
 
-		// Write back to yourself
-		_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
-		w, err := conn.NextWriter(websocket.TextMessage)
-		if err != nil {
-			return
-		}
-		_, _ = w.Write(fmt.Appendf(nil, "%s: %s", userID, message))
-		if err := w.Close(); err != nil {
-			return
-		}
+type ChatSession[T any] struct {
+	ch   chan []byte
+	conn *websocket.Conn
+	done chan struct{}
+	id   string
+	once sync.Once
+}
+
+func NewChatSession[T any](conn *websocket.Conn, id string) *ChatSession[T] {
+	return &ChatSession[T]{
+		ch:   make(chan []byte),
+		conn: conn,
+		done: make(chan struct{}),
+		id:   id,
 	}
 }
 
-func writePump(ctx context.Context, conn *websocket.Conn, userID, friendID string) {
+func (s *ChatSession[T]) WriteJSON(v T) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-s.done:
+		return ErrClosed
+	case s.ch <- b:
+		return nil
+	}
+}
+
+func (s *ChatSession[T]) Write(ctx context.Context, msg []byte) error {
+	select {
+	case <-s.done:
+		return ErrClosed
+	case s.ch <- msg:
+		return nil
+	}
+}
+
+func (s *ChatSession[T]) writer() {
+	conn := s.conn
+
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
 		_ = conn.Close()
 	}()
 
-	pubsub := rdb.Subscribe(ctx, userID)
 	for {
 		select {
-		case <-ctx.Done():
+		case <-s.done:
 			return
-		case message, ok := <-pubsub.Channel():
+			// TODO: Instead of waiting for the message, we can buffer the message
+			// and flush it periodically, e.g. every 100ms.
+		case message, ok := <-s.ch:
 			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
 				_ = conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
-			w, err := conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			_, _ = w.Write(fmt.Appendf(nil, "%s: %s", friendID, message.Payload))
-			if err := w.Close(); err != nil {
-				return
-			}
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			_ = conn.WriteMessage(websocket.TextMessage, message)
+			/*
+				Use this for large payload.
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+				w, err := conn.NextWriter(websocket.TextMessage)
+				if err != nil {
+					return
+				}
+				_, _ = w.Write(msg)
+				if err := w.Close(); err != nil {
+					return
+				}
+			*/
 		case <-ticker.C:
 			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -112,49 +182,97 @@ func writePump(ctx context.Context, conn *websocket.Conn, userID, friendID strin
 	}
 }
 
-// serveWs handles websocket requests from the peer.
-func serveWs(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	q := r.URL.Query()
-	userID := q.Get("from")
-	friendID := q.Get("to")
-	userAgent := "web"
-
-	// Avoid using r.Context(), might have issue with flusher etc.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func (s *ChatSession[T]) ReadJSON(fn func(T) error) {
+	defer s.stop()
 
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		// Received from your friend, write to yourself.
-		writePump(ctx, conn, userID, friendID)
+	wg.Go(s.writer)
+
+	conn := s.conn
+	conn.SetReadLimit(maxMessageSize)
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
-	wg.Go(func() {
-		defer cancel()
-		// Read from yourself, send to your friend.
-		readPump(ctx, conn, userID, friendID)
-	})
-	wg.Go(func() {
-		keepOnline(ctx, userID, userAgent)
-	})
+
+	for {
+		var t T
+		err := conn.ReadJSON(&t)
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("error: %v", err)
+			}
+			break
+		}
+		if err := fn(t); err != nil {
+			log.Printf("error: %v", err)
+			_ = conn.WriteMessage(websocket.CloseMessage, []byte{})
+			break
+		}
+	}
+
+	// Stop writer.
+	s.stop()
 	wg.Wait()
+}
+
+func (s *ChatSession[T]) Read(fn func([]byte) error) {
+	defer s.stop()
+
+	var wg sync.WaitGroup
+	wg.Go(s.writer)
+
+	conn := s.conn
+	conn.SetReadLimit(maxMessageSize)
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	// Block reads until disconnected.
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("error: %v", err)
+			}
+			break
+		}
+		if err := fn(message); err != nil {
+			log.Printf("error: %v", err)
+			_ = conn.WriteMessage(websocket.CloseMessage, []byte{})
+			break
+		}
+	}
+
+	// Stop writer.
+	s.stop()
+	wg.Wait()
+}
+
+func (s *ChatSession[T]) stop() {
+	s.once.Do(func() {
+		close(s.done)
+		_ = s.conn.Close()
+	})
 }
 
 func keepOnline(ctx context.Context, userID string, userAgent string) {
 	t := time.NewTicker((stayOnlinePeriod * 9) / 10)
 	defer t.Stop()
 
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379", // use default address
+		Password: "",               // no password set
+		DB:       0,                // use default DB
+	})
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			key := Key("users", userID)
+			key := fmt.Sprintf("users:%s", userID)
 			val := map[string]any{
 				userAgent: "session-id",
 				// web: session-id,
@@ -172,8 +290,4 @@ func keepOnline(ctx context.Context, userID string, userAgent string) {
 			}
 		}
 	}
-}
-
-func Key(ss ...string) string {
-	return strings.Join(ss, ":")
 }
