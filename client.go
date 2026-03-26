@@ -55,7 +55,7 @@ func (svr *wsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// authorize
 	// validate
-	// create session
+	// create chat
 
 	id := r.URL.Query().Get("chat_id")
 	userID := r.URL.Query().Get("user_id")
@@ -63,7 +63,7 @@ func (svr *wsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	session := NewChatSession[any](conn, id)
+	chat := NewChat[any](conn, id)
 
 	var wg sync.WaitGroup
 	// Write back to websocket.
@@ -78,7 +78,7 @@ func (svr *wsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case <-ctx.Done():
 				return
 			case msg := <-pubsub.Channel():
-				err = session.Write(ctx, []byte(msg.Payload))
+				err = chat.Write(ctx, []byte(msg.Payload))
 				if err != nil {
 					return
 				}
@@ -89,7 +89,7 @@ func (svr *wsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// wg.Go(func() { stayOnline() })
 
 	// Read websocket messages. Blocking read.
-	session.Read(func(msg []byte) error {
+	chat.Read(func(msg []byte) error {
 		return svr.rdb.Publish(ctx, id, fmt.Appendf(nil, "%s: %s", userID, msg)).Err()
 	})
 	cancel()
@@ -97,7 +97,7 @@ func (svr *wsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Println("disconnected from", id)
 }
 
-type ChatSession[T any] struct {
+type Chat[T any] struct {
 	ch   chan []byte
 	conn *websocket.Conn
 	done chan struct{}
@@ -105,8 +105,8 @@ type ChatSession[T any] struct {
 	once sync.Once
 }
 
-func NewChatSession[T any](conn *websocket.Conn, id string) *ChatSession[T] {
-	return &ChatSession[T]{
+func NewChat[T any](conn *websocket.Conn, id string) *Chat[T] {
+	return &Chat[T]{
 		ch:   make(chan []byte),
 		conn: conn,
 		done: make(chan struct{}),
@@ -114,31 +114,31 @@ func NewChatSession[T any](conn *websocket.Conn, id string) *ChatSession[T] {
 	}
 }
 
-func (s *ChatSession[T]) WriteJSON(v T) error {
+func (c *Chat[T]) WriteJSON(v T) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
 
 	select {
-	case <-s.done:
+	case <-c.done:
 		return ErrClosed
-	case s.ch <- b:
+	case c.ch <- b:
 		return nil
 	}
 }
 
-func (s *ChatSession[T]) Write(ctx context.Context, msg []byte) error {
+func (c *Chat[T]) Write(ctx context.Context, msg []byte) error {
 	select {
-	case <-s.done:
+	case <-c.done:
 		return ErrClosed
-	case s.ch <- msg:
+	case c.ch <- msg:
 		return nil
 	}
 }
 
-func (s *ChatSession[T]) writer() {
-	conn := s.conn
+func (c *Chat[T]) writer() {
+	conn := c.conn
 
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -148,11 +148,11 @@ func (s *ChatSession[T]) writer() {
 
 	for {
 		select {
-		case <-s.done:
+		case <-c.done:
 			return
 			// TODO: Instead of waiting for the message, we can buffer the message
 			// and flush it periodically, e.g. every 100ms.
-		case message, ok := <-s.ch:
+		case message, ok := <-c.ch:
 			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
 				_ = conn.WriteMessage(websocket.CloseMessage, []byte{})
@@ -182,13 +182,13 @@ func (s *ChatSession[T]) writer() {
 	}
 }
 
-func (s *ChatSession[T]) ReadJSON(fn func(T) error) {
-	defer s.stop()
+func (c *Chat[T]) ReadJSON(fn func(T) error) {
+	defer c.stop()
 
 	var wg sync.WaitGroup
-	wg.Go(s.writer)
+	wg.Go(c.writer)
 
-	conn := s.conn
+	conn := c.conn
 	conn.SetReadLimit(maxMessageSize)
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
@@ -212,17 +212,17 @@ func (s *ChatSession[T]) ReadJSON(fn func(T) error) {
 	}
 
 	// Stop writer.
-	s.stop()
+	c.stop()
 	wg.Wait()
 }
 
-func (s *ChatSession[T]) Read(fn func([]byte) error) {
-	defer s.stop()
+func (c *Chat[T]) Read(fn func([]byte) error) {
+	defer c.stop()
 
 	var wg sync.WaitGroup
-	wg.Go(s.writer)
+	wg.Go(c.writer)
 
-	conn := s.conn
+	conn := c.conn
 	conn.SetReadLimit(maxMessageSize)
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
@@ -246,14 +246,14 @@ func (s *ChatSession[T]) Read(fn func([]byte) error) {
 	}
 
 	// Stop writer.
-	s.stop()
+	c.stop()
 	wg.Wait()
 }
 
-func (s *ChatSession[T]) stop() {
-	s.once.Do(func() {
-		close(s.done)
-		_ = s.conn.Close()
+func (c *Chat[T]) stop() {
+	c.once.Do(func() {
+		close(c.done)
+		_ = c.conn.Close()
 	})
 }
 
@@ -274,10 +274,10 @@ func keepOnline(ctx context.Context, userID string, userAgent string) {
 		case <-t.C:
 			key := fmt.Sprintf("users:%s", userID)
 			val := map[string]any{
-				userAgent: "session-id",
-				// web: session-id,
-				// ios: session-id,
-				// android: session-id,
+				userAgent: "chat-id",
+				// web: chat-id,
+				// ios: chat-id,
+				// android: chat-id,
 			}
 
 			// If you do not need to support multiple devices, just use SET.
