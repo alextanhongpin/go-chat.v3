@@ -153,8 +153,8 @@ func (c *Chat[T]) writer() {
 			// TODO: Instead of waiting for the message, we can buffer the message
 			// and flush it periodically, e.g. every 100ms.
 		case message, ok := <-c.ch:
-			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 				_ = conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
